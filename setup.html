@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Project Board – one-time setup</title>
+<style>
+  body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#222}
+  h1{color:#8c1d1d;font-size:22px;margin-bottom:4px}
+  .box{border:1px solid #ddd;border-radius:8px;padding:16px 18px;margin:18px 0}
+  button{background:#8c1d1d;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  #log{background:#f6f6f6;border-radius:6px;padding:12px;white-space:pre-wrap;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;min-height:60px;max-height:420px;overflow:auto}
+  .warn{color:#8c1d1d}
+</style>
+</head>
+<body>
+<h1>Project Board – one-time setup</h1>
+<p>This page moves your existing board (users, tasks, leave requests and history) into your Firebase project.
+Run it once, right after publishing the security rules. Everyone keeps their current username and password.</p>
+
+<div class="box">
+  <b>1.</b> Choose the file <code>board-export.json</code>:<br><br>
+  <input type="file" id="file" accept=".json,application/json">
+</div>
+<div class="box">
+  <b>2.</b> <button id="run" disabled>Run setup</button>
+  <p class="warn" id="status"></p>
+</div>
+<div id="log"></div>
+<p class="warn"><b>When it says “Setup finished”:</b> delete <code>setup.html</code> and <code>board-export.json</code> from your hosting and your computer. The export file can be used to sign in as anyone.</p>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="fb-common.js"></script>
+<script>
+(function(){
+  var PB = window.PB, data = null;
+  var logEl = document.getElementById('log'), runBtn = document.getElementById('run'), statusEl = document.getElementById('status');
+  function log(s){ logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+  if (!PB || !PB.ready) { statusEl.textContent = (PB && PB.error) || 'Firebase is not configured.'; return; }
+  var db = PB.db, auth = PB.auth;
+  var GRAND = 'maged', BUILTIN = 'projectboard';
+  var COLS = ['tasks', 'leaves', 'leaveAttempts', 'comments', 'activity'];
+
+  document.getElementById('file').addEventListener('change', function(){
+    var f = this.files && this.files[0];
+    if (!f) return;
+    f.text().then(function(t){
+      data = JSON.parse(t);
+      if (!data.collections || !data.collections.accounts || !data.collections.accounts[GRAND]) throw new Error('bad file');
+      var c = data.collections;
+      log('File loaded: ' + Object.keys(c.accounts).length + ' users, ' + Object.keys(c.tasks || {}).length + ' tasks, ' +
+        Object.keys(c.leaves || {}).length + ' leave requests, ' + Object.keys(c.activity || {}).length + ' history entries.');
+      runBtn.disabled = false;
+    }).catch(function(){ statusEl.textContent = 'That is not a Project Board export file.'; runBtn.disabled = true; });
+  });
+
+  function clean(d){ var o = Object.assign({}, d); delete o.hash; return o; }
+
+  function bootstrapOrSignIn(){
+    var grandHash = data.collections.accounts[GRAND].hash;
+    return db.doc('config/setup').get().then(function(s){
+      if (s.exists) {
+        log('Setup was run before; signing in as ' + GRAND + ' to continue…');
+        return PB.signIn(GRAND, grandHash).then(function(ok){ if (!ok) throw new Error('Could not sign in as ' + GRAND + ' (password changed since the export?).'); });
+      }
+      log('Creating the grand admin (' + GRAND + ')…');
+      return PB.createLogin(GRAND, grandHash).then(function(login){
+        return auth.signInWithEmailAndPassword(login.email, grandHash).then(function(){
+          var b = db.batch();
+          b.set(db.doc('accounts/' + GRAND), Object.assign(clean(data.collections.accounts[GRAND]), {uid: login.uid}));
+          b.set(db.doc('uids/' + login.uid), {user: GRAND});
+          b.set(db.doc('logins/' + GRAND), {email: login.email});
+          b.set(db.doc('config/setup'), {at: Date.now()});
+          return b.commit();
+        });
+      });
+    });
+  }
+
+  function importUser(name, rec){
+    return db.doc('logins/' + name).get().then(function(s){
+      if (s.exists) { log('  ' + name + ': already there, skipped'); return; }
+      return PB.createLogin(name, rec.hash).then(function(login){
+        var b = db.batch();
+        if (name !== BUILTIN) b.set(db.doc('accounts/' + name), Object.assign(clean(rec), {uid: login.uid}));
+        b.set(db.doc('uids/' + login.uid), {user: name});
+        b.set(db.doc('logins/' + name), {email: login.email});
+        return b.commit().then(function(){ log('  ' + name + ': done'); });
+      });
+    });
+  }
+
+  runBtn.addEventListener('click', function(){
+    if (!data) return;
+    runBtn.disabled = true; statusEl.textContent = '';
+    var chain = bootstrapOrSignIn().then(function(){ log('Signed in as ' + GRAND + '.\nUsers:'); });
+    var acc = data.collections.accounts;
+    Object.keys(acc).filter(function(n){ return n !== GRAND; }).forEach(function(n){
+      chain = chain.then(function(){ return importUser(n, acc[n]); });
+    });
+    if (data.builtIn && data.builtIn[BUILTIN]) chain = chain.then(function(){ return importUser(BUILTIN, data.builtIn[BUILTIN]); });
+    COLS.forEach(function(col){
+      chain = chain.then(function(){
+        var docs = data.collections[col] || {}, ids = Object.keys(docs);
+        if (!ids.length) return;
+        var b = db.batch();
+        ids.forEach(function(id){ b.set(db.doc(col + '/' + id), docs[id]); });
+        return b.commit().then(function(){ log(col + ': ' + ids.length + ' saved'); });
+      });
+    });
+    chain.then(function(){
+      log('\nSetup finished. Open index.html and sign in as usual.');
+      statusEl.textContent = 'Setup finished. Now delete setup.html and board-export.json.';
+      return auth.signOut();
+    }).catch(function(err){
+      log('\nSTOPPED: ' + ((err && (err.message || err.code)) || err));
+      statusEl.textContent = 'Setup stopped. Fix the problem shown below and press Run setup again — finished steps are skipped.';
+      runBtn.disabled = false;
+    });
+  });
+})();
+</script>
+</body>
+</html>
